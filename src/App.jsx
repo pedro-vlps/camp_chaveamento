@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 
-const STORAGE_KEY = 'camp-manager-state-v2';
+const STORAGE_KEY = 'camp-manager-state-v3';
 
 const INITIAL_STATE = {
   teams: [],
   locked: false,
   results: {},
-  playerStats: {},
+  matchEvents: {},
 };
 
 const SLOT_ORDERS = {
@@ -273,55 +273,47 @@ const ROUND_TITLES = {
   },
 };
 
-const PLAYER_FIELDS = [
-  { key: 'goals', label: 'Gols' },
-  { key: 'assists', label: 'Assist.' },
-  { key: 'yellowCards', label: 'Amarelos' },
-  { key: 'redCards', label: 'Vermelhos' },
+const EVENT_OPTIONS = [
+  { value: 'goal', label: 'Gol' },
+  { value: 'yellow', label: 'Cartao amarelo' },
+  { value: 'red', label: 'Cartao vermelho' },
 ];
 
-function createPlayerEntry() {
+function createEventEntry() {
   return {
-    id: `player-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-    name: '',
-    goals: 0,
-    assists: 0,
-    yellowCards: 0,
-    redCards: 0,
+    id: `event-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    type: 'goal',
+    playerName: '',
+    assistName: '',
+    ownGoal: false,
   };
 }
 
-function sanitizeStatValue(value) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-}
-
-function normalizePlayerRows(rows) {
+function normalizeEventRows(rows) {
   if (!Array.isArray(rows)) {
     return [];
   }
 
   return rows.map((row) => ({
-    id: typeof row?.id === 'string' ? row.id : createPlayerEntry().id,
-    name: typeof row?.name === 'string' ? row.name : '',
-    goals: sanitizeStatValue(row?.goals),
-    assists: sanitizeStatValue(row?.assists),
-    yellowCards: sanitizeStatValue(row?.yellowCards),
-    redCards: sanitizeStatValue(row?.redCards),
+    id: typeof row?.id === 'string' ? row.id : createEventEntry().id,
+    type: row?.type === 'yellow' || row?.type === 'red' ? row.type : 'goal',
+    playerName: typeof row?.playerName === 'string' ? row.playerName : '',
+    assistName: typeof row?.assistName === 'string' ? row.assistName : '',
+    ownGoal: Boolean(row?.ownGoal),
   }));
 }
 
-function normalizePlayerStats(playerStats) {
-  if (!playerStats || typeof playerStats !== 'object') {
+function normalizeMatchEvents(matchEvents) {
+  if (!matchEvents || typeof matchEvents !== 'object') {
     return {};
   }
 
   return Object.fromEntries(
-    Object.entries(playerStats).map(([matchId, sides]) => [
+    Object.entries(matchEvents).map(([matchId, sides]) => [
       matchId,
       {
-        A: normalizePlayerRows(sides?.A),
-        B: normalizePlayerRows(sides?.B),
+        A: normalizeEventRows(sides?.A),
+        B: normalizeEventRows(sides?.B),
       },
     ]),
   );
@@ -344,7 +336,7 @@ function loadState() {
       teams: Array.isArray(parsed.teams) ? parsed.teams : [],
       locked: Boolean(parsed.locked),
       results: parsed.results && typeof parsed.results === 'object' ? parsed.results : {},
-      playerStats: normalizePlayerStats(parsed.playerStats),
+      matchEvents: normalizeMatchEvents(parsed.matchEvents),
     };
   } catch {
     return INITIAL_STATE;
@@ -482,29 +474,42 @@ function groupMatches(matches, bracketSize, bracket) {
   }));
 }
 
-function getPlayerRows(playerStats, matchId, side) {
-  return playerStats[matchId]?.[side] ?? [];
+function getEventRows(matchEvents, matchId, side) {
+  return matchEvents[matchId]?.[side] ?? [];
 }
 
-function calculatePlayerTotals(rows) {
-  return rows.reduce(
-    (totals, row) => ({
-      goals: totals.goals + row.goals,
-      assists: totals.assists + row.assists,
-      yellowCards: totals.yellowCards + row.yellowCards,
-      redCards: totals.redCards + row.redCards,
-    }),
-    {
-      goals: 0,
-      assists: 0,
-      yellowCards: 0,
-      redCards: 0,
-    },
-  );
+function calculateSideScore(rows, opponentRows) {
+  const directGoals = rows.filter((event) => event.type === 'goal' && !event.ownGoal).length;
+  const opponentOwnGoals = opponentRows.filter(
+    (event) => event.type === 'goal' && event.ownGoal,
+  ).length;
+
+  return directGoals + opponentOwnGoals;
 }
 
-function createPlayerRanking(matches, playerStats) {
-  const rankingMap = new Map();
+function calculateMatchScore(matchId, matchEvents) {
+  const rowsA = getEventRows(matchEvents, matchId, 'A');
+  const rowsB = getEventRows(matchEvents, matchId, 'B');
+
+  return {
+    A: calculateSideScore(rowsA, rowsB),
+    B: calculateSideScore(rowsB, rowsA),
+  };
+}
+
+function createRankingList(map, sortFn) {
+  return Array.from(map.values())
+    .map((entry) => ({
+      ...entry,
+      matches: entry.matchIds.size,
+    }))
+    .sort(sortFn);
+}
+
+function createRankings(matches, matchEvents) {
+  const goalsMap = new Map();
+  const assistsMap = new Map();
+  const cardsMap = new Map();
 
   matches.forEach((match) => {
     ['A', 'B'].forEach((side) => {
@@ -513,131 +518,178 @@ function createPlayerRanking(matches, playerStats) {
         return;
       }
 
-      getPlayerRows(playerStats, match.id, side).forEach((row) => {
-        const normalizedName = row.name.trim();
-        if (!normalizedName) {
-          return;
+      getEventRows(matchEvents, match.id, side).forEach((event) => {
+        const playerName = event.playerName.trim();
+
+        if (event.type === 'goal') {
+          if (!event.ownGoal && playerName) {
+            const goalKey = `${playerName.toLowerCase()}::${teamName.toLowerCase()}`;
+            const goalEntry = goalsMap.get(goalKey) ?? {
+              name: playerName,
+              team: teamName,
+              total: 0,
+              matchIds: new Set(),
+            };
+
+            goalEntry.total += 1;
+            goalEntry.matchIds.add(match.id);
+            goalsMap.set(goalKey, goalEntry);
+          }
+
+          const assistName = event.ownGoal ? '' : event.assistName.trim();
+          if (assistName) {
+            const assistKey = `${assistName.toLowerCase()}::${teamName.toLowerCase()}`;
+            const assistEntry = assistsMap.get(assistKey) ?? {
+              name: assistName,
+              team: teamName,
+              total: 0,
+              matchIds: new Set(),
+            };
+
+            assistEntry.total += 1;
+            assistEntry.matchIds.add(match.id);
+            assistsMap.set(assistKey, assistEntry);
+          }
         }
 
-        const key = `${normalizedName.toLowerCase()}::${teamName.toLowerCase()}`;
-        const existing = rankingMap.get(key) ?? {
-          name: normalizedName,
-          team: teamName,
-          goals: 0,
-          assists: 0,
-          yellowCards: 0,
-          redCards: 0,
-          matchIds: new Set(),
-        };
+        if ((event.type === 'yellow' || event.type === 'red') && playerName) {
+          const cardKey = `${playerName.toLowerCase()}::${teamName.toLowerCase()}`;
+          const cardEntry = cardsMap.get(cardKey) ?? {
+            name: playerName,
+            team: teamName,
+            yellow: 0,
+            red: 0,
+            matchIds: new Set(),
+          };
 
-        existing.goals += row.goals;
-        existing.assists += row.assists;
-        existing.yellowCards += row.yellowCards;
-        existing.redCards += row.redCards;
-        existing.matchIds.add(match.id);
+          if (event.type === 'yellow') {
+            cardEntry.yellow += 1;
+          } else {
+            cardEntry.red += 1;
+          }
 
-        rankingMap.set(key, existing);
+          cardEntry.matchIds.add(match.id);
+          cardsMap.set(cardKey, cardEntry);
+        }
       });
     });
   });
 
-  return Array.from(rankingMap.values())
-    .map((player) => ({
-      name: player.name,
-      team: player.team,
-      goals: player.goals,
-      assists: player.assists,
-      yellowCards: player.yellowCards,
-      redCards: player.redCards,
-      matches: player.matchIds.size,
-      contributions: player.goals + player.assists,
-    }))
-    .sort((left, right) => {
-      if (right.goals !== left.goals) {
-        return right.goals - left.goals;
-      }
-      if (right.assists !== left.assists) {
-        return right.assists - left.assists;
-      }
-      if (right.contributions !== left.contributions) {
-        return right.contributions - left.contributions;
-      }
-      if (left.redCards !== right.redCards) {
-        return left.redCards - right.redCards;
-      }
-      if (left.yellowCards !== right.yellowCards) {
-        return left.yellowCards - right.yellowCards;
+  return {
+    goals: createRankingList(goalsMap, (left, right) => {
+      if (right.total !== left.total) {
+        return right.total - left.total;
       }
       return left.name.localeCompare(right.name, 'pt-BR');
-    });
+    }),
+    assists: createRankingList(assistsMap, (left, right) => {
+      if (right.total !== left.total) {
+        return right.total - left.total;
+      }
+      return left.name.localeCompare(right.name, 'pt-BR');
+    }),
+    cards: createRankingList(cardsMap, (left, right) => {
+      if (right.red !== left.red) {
+        return right.red - left.red;
+      }
+      if (right.yellow !== left.yellow) {
+        return right.yellow - left.yellow;
+      }
+      return left.name.localeCompare(right.name, 'pt-BR');
+    }),
+  };
 }
 
-function PlayerStatsEditor({
-  teamName,
-  rows,
-  disabled,
-  onAddPlayer,
-  onRemovePlayer,
-  onUpdatePlayer,
-}) {
-  const totals = calculatePlayerTotals(rows);
-
+function EventEditor({ teamName, rows, disabled, onAddEvent, onRemoveEvent, onUpdateEvent }) {
   return (
-    <section className="player-editor">
-      <div className="player-editor__header">
+    <section className="event-editor">
+      <div className="event-editor__header">
         <div>
           <h5>{teamName ?? 'A definir'}</h5>
-          <p>Registre as estatisticas individuais deste time nesta partida.</p>
+          <p>Cadastre os eventos deste time nesta partida.</p>
         </div>
-        <button type="button" className="ghost-button ghost-button--small" disabled={disabled} onClick={onAddPlayer}>
-          Adicionar jogador
+        <button
+          type="button"
+          className="ghost-button ghost-button--small"
+          disabled={disabled}
+          onClick={onAddEvent}
+        >
+          Adicionar evento
         </button>
       </div>
 
-      <div className="player-editor__totals">
-        <span>Gols: {totals.goals}</span>
-        <span>Assist.: {totals.assists}</span>
-        <span>Amarelos: {totals.yellowCards}</span>
-        <span>Vermelhos: {totals.redCards}</span>
-      </div>
-
       {rows.length === 0 ? (
-        <p className="player-editor__empty">Nenhum jogador registrado para este jogo.</p>
+        <p className="event-editor__empty">Nenhum evento cadastrado.</p>
       ) : (
-        <div className="player-editor__list">
-          {rows.map((row) => (
-            <div key={row.id} className="player-row">
-              <label className="player-row__name">
-                <span>Jogador</span>
-                <input
-                  type="text"
-                  value={row.name}
-                  placeholder="Nome do jogador"
-                  disabled={disabled}
-                  onChange={(event) => onUpdatePlayer(row.id, 'name', event.target.value)}
-                />
-              </label>
+        <div className="event-editor__list">
+          {rows.map((event) => (
+            <div key={event.id} className="event-row">
+              <div className="event-row__top">
+                <label className="field">
+                  <span>Tipo</span>
+                  <select
+                    value={event.type}
+                    disabled={disabled}
+                    onChange={(changeEvent) =>
+                      onUpdateEvent(event.id, 'type', changeEvent.target.value)
+                    }
+                  >
+                    {EVENT_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
 
-              <div className="player-row__stats">
-                {PLAYER_FIELDS.map((field) => (
-                  <label key={field.key} className="stat-field">
-                    <span>{field.label}</span>
+                <label className="field">
+                  <span>Jogador</span>
+                  <input
+                    type="text"
+                    value={event.playerName}
+                    placeholder="Nome do jogador"
+                    disabled={disabled}
+                    onChange={(changeEvent) =>
+                      onUpdateEvent(event.id, 'playerName', changeEvent.target.value)
+                    }
+                  />
+                </label>
+              </div>
+
+              {event.type === 'goal' && (
+                <div className="event-row__goal">
+                  <label className="field">
+                    <span>Assistencia</span>
                     <input
-                      type="number"
-                      min="0"
-                      value={row[field.key]}
-                      disabled={disabled}
-                      onChange={(event) => onUpdatePlayer(row.id, field.key, event.target.value)}
+                      type="text"
+                      value={event.assistName}
+                      placeholder="Quem deu a assistencia"
+                      disabled={disabled || event.ownGoal}
+                      onChange={(changeEvent) =>
+                        onUpdateEvent(event.id, 'assistName', changeEvent.target.value)
+                      }
                     />
                   </label>
-                ))}
-              </div>
+
+                  <label className="checkbox-field">
+                    <input
+                      type="checkbox"
+                      checked={event.ownGoal}
+                      disabled={disabled}
+                      onChange={(changeEvent) =>
+                        onUpdateEvent(event.id, 'ownGoal', changeEvent.target.checked)
+                      }
+                    />
+                    <span>Gol contra</span>
+                  </label>
+                </div>
+              )}
 
               <button
                 type="button"
-                className="player-row__remove"
+                className="event-row__remove"
                 disabled={disabled}
-                onClick={() => onRemovePlayer(row.id)}
+                onClick={() => onRemoveEvent(event.id)}
               >
                 remover
               </button>
@@ -651,19 +703,21 @@ function PlayerStatsEditor({
 
 function MatchCard({
   match,
-  playerStats,
-  onAddPlayer,
-  onRemovePlayer,
-  onUpdatePlayer,
+  matchEvents,
+  onAddEvent,
+  onRemoveEvent,
+  onUpdateEvent,
   onPickWinner,
 }) {
+  const score = calculateMatchScore(match.id, matchEvents);
+
   const waitingMessage = !match.ready
     ? 'Aguardando definicao das partidas anteriores.'
     : !match.canPickWinner && match.resolution === 'bye'
       ? 'Avanco automatico por ausencia de adversario.'
       : !match.canPickWinner && match.resolution === 'empty'
         ? 'Rodada sem confronto por falta de times nesta chave.'
-        : 'Escolha o vencedor e registre as estatisticas do jogo.';
+        : 'Escolha o vencedor manualmente. O placar e calculado pelos eventos.';
 
   return (
     <article className="match-card">
@@ -682,11 +736,19 @@ function MatchCard({
 
       <p className="match-card__description">{match.description}</p>
 
+      <div className="match-score">
+        <span className="match-score__team">{match.participantA ?? 'A definir'}</span>
+        <strong>
+          {score.A} x {score.B}
+        </strong>
+        <span className="match-score__team">{match.participantB ?? 'A definir'}</span>
+      </div>
+
       <div className="match-card__teams">
         {[
-          ['A', match.participantA],
-          ['B', match.participantB],
-        ].map(([side, team]) => {
+          ['A', match.participantA, score.A],
+          ['B', match.participantB, score.B],
+        ].map(([side, team, teamScore]) => {
           const isWinner = match.winner === team && Boolean(team);
           const isLoser = match.loser === team && Boolean(team);
 
@@ -707,33 +769,69 @@ function MatchCard({
             >
               <span className="team-option__side">{side}</span>
               <span className="team-option__name">{team ?? 'A definir'}</span>
+              <span className="team-option__score">{teamScore}</span>
             </button>
           );
         })}
       </div>
 
       <div className="match-card__stats">
-        <PlayerStatsEditor
+        <EventEditor
           teamName={match.participantA}
-          rows={getPlayerRows(playerStats, match.id, 'A')}
+          rows={getEventRows(matchEvents, match.id, 'A')}
           disabled={!match.participantA}
-          onAddPlayer={() => onAddPlayer(match.id, 'A')}
-          onRemovePlayer={(playerId) => onRemovePlayer(match.id, 'A', playerId)}
-          onUpdatePlayer={(playerId, field, value) => onUpdatePlayer(match.id, 'A', playerId, field, value)}
+          onAddEvent={() => onAddEvent(match.id, 'A')}
+          onRemoveEvent={(eventId) => onRemoveEvent(match.id, 'A', eventId)}
+          onUpdateEvent={(eventId, field, value) => onUpdateEvent(match.id, 'A', eventId, field, value)}
         />
 
-        <PlayerStatsEditor
+        <EventEditor
           teamName={match.participantB}
-          rows={getPlayerRows(playerStats, match.id, 'B')}
+          rows={getEventRows(matchEvents, match.id, 'B')}
           disabled={!match.participantB}
-          onAddPlayer={() => onAddPlayer(match.id, 'B')}
-          onRemovePlayer={(playerId) => onRemovePlayer(match.id, 'B', playerId)}
-          onUpdatePlayer={(playerId, field, value) => onUpdatePlayer(match.id, 'B', playerId, field, value)}
+          onAddEvent={() => onAddEvent(match.id, 'B')}
+          onRemoveEvent={(eventId) => onRemoveEvent(match.id, 'B', eventId)}
+          onUpdateEvent={(eventId, field, value) => onUpdateEvent(match.id, 'B', eventId, field, value)}
         />
       </div>
 
       <p className="match-card__footer">{waitingMessage}</p>
     </article>
+  );
+}
+
+function RankingBlock({ title, subtitle, items, renderMetrics }) {
+  return (
+    <section className="ranking-block">
+      <div className="ranking-block__header">
+        <h3>{title}</h3>
+        <p>{subtitle}</p>
+      </div>
+
+      {items.length === 0 ? (
+        <p className="empty-state">Ainda nao ha dados suficientes para este ranking.</p>
+      ) : (
+        <div className="ranking-list">
+          {items.map((item, index) => (
+            <article
+              key={`${title}-${item.team}-${item.name}`}
+              className={`ranking-card ${index === 0 ? 'ranking-card--leader' : ''}`}
+            >
+              <div className="ranking-card__top">
+                <div>
+                  <span className="ranking-card__position">#{index + 1}</span>
+                  <h3>{item.name}</h3>
+                  <p>{item.team}</p>
+                </div>
+                {renderMetrics(item, true)}
+              </div>
+
+              <div className="ranking-card__stats">{renderMetrics(item, false)}</div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -773,16 +871,19 @@ export default function App() {
     () => (bracketSize ? groupMatches(resolvedMatches, bracketSize, 'grand') : []),
     [bracketSize, resolvedMatches],
   );
-  const playerRanking = useMemo(
-    () => createPlayerRanking(resolvedMatches, state.playerStats),
-    [resolvedMatches, state.playerStats],
+  const rankings = useMemo(
+    () => createRankings(resolvedMatches, state.matchEvents),
+    [resolvedMatches, state.matchEvents],
   );
 
   const completedMatches = resolvedMatches.filter((match) => match.resolution === 'manual').length;
   const champion = resolvedMatches.find((match) => match.id === 'G1')?.winner ?? null;
   const canStart = state.teams.length >= 4;
   const hasByes = state.locked && state.teams.length !== bracketSize;
-  const topPlayer = playerRanking[0] ?? null;
+  const totalEvents = Object.values(state.matchEvents).reduce(
+    (sum, sides) => sum + (sides.A?.length ?? 0) + (sides.B?.length ?? 0),
+    0,
+  );
 
   useEffect(() => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -823,7 +924,7 @@ export default function App() {
       ...current,
       locked: true,
       results: {},
-      playerStats: {},
+      matchEvents: {},
     }));
   }
 
@@ -832,7 +933,7 @@ export default function App() {
       ...current,
       locked: false,
       results: {},
-      playerStats: {},
+      matchEvents: {},
     }));
   }
 
@@ -844,12 +945,12 @@ export default function App() {
   function handlePickWinner(matchId, side) {
     setState((current) => {
       const nextResults = { ...current.results };
-      const nextPlayerStats = { ...current.playerStats };
+      const nextMatchEvents = { ...current.matchEvents };
       const descendants = dependencyMap.get(matchId) ?? new Set();
 
       descendants.forEach((dependentId) => {
         delete nextResults[dependentId];
-        delete nextPlayerStats[dependentId];
+        delete nextMatchEvents[dependentId];
       });
 
       if (nextResults[matchId] === side) {
@@ -861,64 +962,75 @@ export default function App() {
       return {
         ...current,
         results: nextResults,
-        playerStats: nextPlayerStats,
+        matchEvents: nextMatchEvents,
       };
     });
   }
 
-  function handleAddPlayer(matchId, side) {
+  function handleAddEvent(matchId, side) {
     setState((current) => {
-      const matchStats = current.playerStats[matchId] ?? { A: [], B: [] };
+      const matchState = current.matchEvents[matchId] ?? { A: [], B: [] };
 
       return {
         ...current,
-        playerStats: {
-          ...current.playerStats,
+        matchEvents: {
+          ...current.matchEvents,
           [matchId]: {
-            ...matchStats,
-            [side]: [...(matchStats[side] ?? []), createPlayerEntry()],
+            ...matchState,
+            [side]: [...(matchState[side] ?? []), createEventEntry()],
           },
         },
       };
     });
   }
 
-  function handleRemovePlayer(matchId, side, playerId) {
+  function handleRemoveEvent(matchId, side, eventId) {
     setState((current) => {
-      const matchStats = current.playerStats[matchId] ?? { A: [], B: [] };
+      const matchState = current.matchEvents[matchId] ?? { A: [], B: [] };
 
       return {
         ...current,
-        playerStats: {
-          ...current.playerStats,
+        matchEvents: {
+          ...current.matchEvents,
           [matchId]: {
-            ...matchStats,
-            [side]: (matchStats[side] ?? []).filter((player) => player.id !== playerId),
+            ...matchState,
+            [side]: (matchState[side] ?? []).filter((event) => event.id !== eventId),
           },
         },
       };
     });
   }
 
-  function handleUpdatePlayer(matchId, side, playerId, field, value) {
+  function handleUpdateEvent(matchId, side, eventId, field, value) {
     setState((current) => {
-      const matchStats = current.playerStats[matchId] ?? { A: [], B: [] };
+      const matchState = current.matchEvents[matchId] ?? { A: [], B: [] };
 
       return {
         ...current,
-        playerStats: {
-          ...current.playerStats,
+        matchEvents: {
+          ...current.matchEvents,
           [matchId]: {
-            ...matchStats,
-            [side]: (matchStats[side] ?? []).map((player) => {
-              if (player.id !== playerId) {
-                return player;
+            ...matchState,
+            [side]: (matchState[side] ?? []).map((event) => {
+              if (event.id !== eventId) {
+                return event;
               }
 
-              return {
-                ...player,
-                [field]: field === 'name' ? value : sanitizeStatValue(value),
+              const updatedEvent = {
+                ...event,
+                [field]: value,
               };
+
+              if (field === 'type' && value !== 'goal') {
+                updatedEvent.assistName = '';
+                updatedEvent.ownGoal = false;
+              }
+
+              if (field === 'ownGoal' && value) {
+                updatedEvent.assistName = '';
+              }
+
+              return updatedEvent;
             }),
           },
         },
@@ -937,8 +1049,8 @@ export default function App() {
             <p className="eyebrow">Camp Manager</p>
             <h1>Gerenciador de campeonatos com chave upper e lower bracket.</h1>
             <p className="hero__text">
-              Cadastre entre 4 e 8 times, monte um torneio em dupla eliminacao, registre
-              estatisticas por jogador e acompanhe o ranking geral.
+              Cadastre entre 4 e 8 times, monte um torneio em dupla eliminacao e registre
+              eventos por partida para alimentar os rankings.
             </p>
           </div>
 
@@ -952,8 +1064,8 @@ export default function App() {
               <strong>{bracketSize ?? '-'}</strong>
             </div>
             <div className="stat-card">
-              <span>Jogadores no ranking</span>
-              <strong>{playerRanking.length}</strong>
+              <span>Eventos</span>
+              <strong>{totalEvents}</strong>
             </div>
           </div>
         </section>
@@ -1030,8 +1142,8 @@ export default function App() {
               cadastro vira o seed do campeonato.
             </p>
             <p>
-              Dentro de cada jogo, voce pode cadastrar jogadores e registrar{' '}
-              <strong>gols, assistencias e cartoes</strong> para alimentar o ranking.
+              Os eventos sao cadastrados por <strong>partida e por time</strong>. Gol contra soma
+              no placar do adversario.
             </p>
           </div>
         </section>
@@ -1076,13 +1188,9 @@ export default function App() {
                   <p>Partidas com vencedor selecionado manualmente.</p>
                 </div>
                 <div className="summary-card">
-                  <span>Jogadores ranqueados</span>
-                  <strong>{playerRanking.length}</strong>
-                  <p>
-                    {topPlayer
-                      ? `${topPlayer.name} lidera com ${topPlayer.goals} gol(s).`
-                      : 'Adicione estatisticas nos jogos para montar o ranking.'}
-                  </p>
+                  <span>Eventos cadastrados</span>
+                  <strong>{totalEvents}</strong>
+                  <p>Inclui gols, assistencias, amarelos e vermelhos por partida.</p>
                 </div>
               </div>
 
@@ -1098,45 +1206,70 @@ export default function App() {
             <section className="panel panel--ranking">
               <div className="panel__heading">
                 <div>
-                  <p className="eyebrow">Ranking</p>
-                  <h2>Lista de jogadores</h2>
+                  <p className="eyebrow">Rankings</p>
+                  <h2>Artilharia, assistencias e cartoes</h2>
                 </div>
               </div>
 
-              {playerRanking.length === 0 ? (
-                <p className="empty-state">
-                  Ainda nao ha estatisticas registradas. Preencha os jogadores dentro das
-                  partidas para gerar o ranking.
-                </p>
-              ) : (
-                <div className="ranking-list">
-                  {playerRanking.map((player, index) => (
-                    <article
-                      key={`${player.team}-${player.name}`}
-                      className={`ranking-card ${index === 0 ? 'ranking-card--leader' : ''}`}
-                    >
-                      <div className="ranking-card__top">
-                        <div>
-                          <span className="ranking-card__position">#{index + 1}</span>
-                          <h3>{player.name}</h3>
-                          <p>{player.team}</p>
-                        </div>
-                        <div className="ranking-card__goals">
-                          <span>Gols</span>
-                          <strong>{player.goals}</strong>
-                        </div>
+              <div className="ranking-grid">
+                <RankingBlock
+                  title="Gols"
+                  subtitle="Conta apenas gols a favor. Gol contra nao entra na artilharia."
+                  items={rankings.goals}
+                  renderMetrics={(item, compact) =>
+                    compact ? (
+                      <div className="ranking-card__goals">
+                        <span>Gols</span>
+                        <strong>{item.total}</strong>
                       </div>
+                    ) : (
+                      <>
+                        <span>Gols: {item.total}</span>
+                        <span>Jogos: {item.matches}</span>
+                      </>
+                    )
+                  }
+                />
 
-                      <div className="ranking-card__stats">
-                        <span>Assistencias: {player.assists}</span>
-                        <span>Jogos: {player.matches}</span>
-                        <span>Amarelos: {player.yellowCards}</span>
-                        <span>Vermelhos: {player.redCards}</span>
+                <RankingBlock
+                  title="Assistencias"
+                  subtitle="Assistencias contam apenas em gols normais."
+                  items={rankings.assists}
+                  renderMetrics={(item, compact) =>
+                    compact ? (
+                      <div className="ranking-card__goals">
+                        <span>Assist.</span>
+                        <strong>{item.total}</strong>
                       </div>
-                    </article>
-                  ))}
-                </div>
-              )}
+                    ) : (
+                      <>
+                        <span>Assistencias: {item.total}</span>
+                        <span>Jogos: {item.matches}</span>
+                      </>
+                    )
+                  }
+                />
+
+                <RankingBlock
+                  title="Cartoes"
+                  subtitle="Ordenado por vermelhos e depois amarelos."
+                  items={rankings.cards}
+                  renderMetrics={(item, compact) =>
+                    compact ? (
+                      <div className="ranking-card__goals">
+                        <span>Cartoes</span>
+                        <strong>{item.red + item.yellow}</strong>
+                      </div>
+                    ) : (
+                      <>
+                        <span>Vermelhos: {item.red}</span>
+                        <span>Amarelos: {item.yellow}</span>
+                        <span>Jogos: {item.matches}</span>
+                      </>
+                    )
+                  }
+                />
+              </div>
             </section>
 
             <section className="bracket-grid">
@@ -1157,10 +1290,10 @@ export default function App() {
                           <MatchCard
                             key={match.id}
                             match={match}
-                            playerStats={state.playerStats}
-                            onAddPlayer={handleAddPlayer}
-                            onRemovePlayer={handleRemovePlayer}
-                            onUpdatePlayer={handleUpdatePlayer}
+                            matchEvents={state.matchEvents}
+                            onAddEvent={handleAddEvent}
+                            onRemoveEvent={handleRemoveEvent}
+                            onUpdateEvent={handleUpdateEvent}
                             onPickWinner={handlePickWinner}
                           />
                         ))}
@@ -1187,10 +1320,10 @@ export default function App() {
                           <MatchCard
                             key={match.id}
                             match={match}
-                            playerStats={state.playerStats}
-                            onAddPlayer={handleAddPlayer}
-                            onRemovePlayer={handleRemovePlayer}
-                            onUpdatePlayer={handleUpdatePlayer}
+                            matchEvents={state.matchEvents}
+                            onAddEvent={handleAddEvent}
+                            onRemoveEvent={handleRemoveEvent}
+                            onUpdateEvent={handleUpdateEvent}
                             onPickWinner={handlePickWinner}
                           />
                         ))}
@@ -1217,10 +1350,10 @@ export default function App() {
                           <MatchCard
                             key={match.id}
                             match={match}
-                            playerStats={state.playerStats}
-                            onAddPlayer={handleAddPlayer}
-                            onRemovePlayer={handleRemovePlayer}
-                            onUpdatePlayer={handleUpdatePlayer}
+                            matchEvents={state.matchEvents}
+                            onAddEvent={handleAddEvent}
+                            onRemoveEvent={handleRemoveEvent}
+                            onUpdateEvent={handleUpdateEvent}
                             onPickWinner={handlePickWinner}
                           />
                         ))}
