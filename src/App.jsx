@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 
-const STORAGE_KEY = 'camp-manager-state-v3';
+const STORAGE_KEY = 'camp-manager-state-v5';
 
 const INITIAL_STATE = {
   teams: [],
   locked: false,
-  results: {},
   matchEvents: {},
+  penalties: {},
 };
 
 const SLOT_ORDERS = {
@@ -279,14 +279,83 @@ const EVENT_OPTIONS = [
   { value: 'red', label: 'Cartao vermelho' },
 ];
 
+function createId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
 function createEventEntry() {
   return {
-    id: `event-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    id: createId('event'),
     type: 'goal',
-    playerName: '',
-    assistName: '',
+    playerId: '',
+    assistPlayerId: '',
     ownGoal: false,
   };
+}
+
+function normalizePlayers(players) {
+  if (!Array.isArray(players)) {
+    return [];
+  }
+
+  return players
+    .map((player) => {
+      if (typeof player === 'string') {
+        const name = player.trim();
+        return name ? { id: createId('player'), name } : null;
+      }
+
+      if (!player || typeof player !== 'object') {
+        return null;
+      }
+
+      const name = typeof player.name === 'string' ? player.name.trim() : '';
+      if (!name) {
+        return null;
+      }
+
+      return {
+        id: typeof player.id === 'string' ? player.id : createId('player'),
+        name,
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeTeams(teams) {
+  if (!Array.isArray(teams)) {
+    return [];
+  }
+
+  return teams
+    .map((team) => {
+      if (typeof team === 'string') {
+        const name = team.trim();
+        return name
+          ? {
+              id: createId('team'),
+              name,
+              players: [],
+            }
+          : null;
+      }
+
+      if (!team || typeof team !== 'object') {
+        return null;
+      }
+
+      const name = typeof team.name === 'string' ? team.name.trim() : '';
+      if (!name) {
+        return null;
+      }
+
+      return {
+        id: typeof team.id === 'string' ? team.id : createId('team'),
+        name,
+        players: normalizePlayers(team.players),
+      };
+    })
+    .filter(Boolean);
 }
 
 function normalizeEventRows(rows) {
@@ -295,10 +364,10 @@ function normalizeEventRows(rows) {
   }
 
   return rows.map((row) => ({
-    id: typeof row?.id === 'string' ? row.id : createEventEntry().id,
+    id: typeof row?.id === 'string' ? row.id : createId('event'),
     type: row?.type === 'yellow' || row?.type === 'red' ? row.type : 'goal',
-    playerName: typeof row?.playerName === 'string' ? row.playerName : '',
-    assistName: typeof row?.assistName === 'string' ? row.assistName : '',
+    playerId: typeof row?.playerId === 'string' ? row.playerId : '',
+    assistPlayerId: typeof row?.assistPlayerId === 'string' ? row.assistPlayerId : '',
     ownGoal: Boolean(row?.ownGoal),
   }));
 }
@@ -319,6 +388,31 @@ function normalizeMatchEvents(matchEvents) {
   );
 }
 
+function normalizePenaltyScore(value) {
+  if (value === '') {
+    return '';
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : '';
+}
+
+function normalizePenalties(penalties) {
+  if (!penalties || typeof penalties !== 'object') {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(penalties).map(([matchId, score]) => [
+      matchId,
+      {
+        A: normalizePenaltyScore(score?.A),
+        B: normalizePenaltyScore(score?.B),
+      },
+    ]),
+  );
+}
+
 function loadState() {
   if (typeof window === 'undefined') {
     return INITIAL_STATE;
@@ -333,10 +427,10 @@ function loadState() {
     const parsed = JSON.parse(raw);
 
     return {
-      teams: Array.isArray(parsed.teams) ? parsed.teams : [],
+      teams: normalizeTeams(parsed.teams),
       locked: Boolean(parsed.locked),
-      results: parsed.results && typeof parsed.results === 'object' ? parsed.results : {},
       matchEvents: normalizeMatchEvents(parsed.matchEvents),
+      penalties: normalizePenalties(parsed.penalties),
     };
   } catch {
     return INITIAL_STATE;
@@ -379,7 +473,7 @@ function createDependencyMap(matches) {
   return new Map(matches.map((match) => [match.id, collect(match.id)]));
 }
 
-function resolveMatches(template, seededTeams, manualResults) {
+function resolveMatches(template, seededTeams, matchEvents, penalties) {
   const matchMap = new Map(template.map((match) => [match.id, match]));
   const cache = new Map();
 
@@ -409,22 +503,35 @@ function resolveMatches(template, seededTeams, manualResults) {
     const leftTeam = left.team;
     const rightTeam = right.team;
     const ready = left.ready && right.ready;
-    const selected = manualResults[matchId];
     const hasLeft = Boolean(leftTeam);
     const hasRight = Boolean(rightTeam);
+    const score = calculateMatchScore(matchId, matchEvents);
+    const penaltyScore = penalties[matchId] ?? { A: '', B: '' };
 
     let winner = null;
     let loser = null;
     let resolution = 'pending';
 
-    if (ready && hasLeft && hasRight && selected === 'A') {
-      winner = leftTeam;
-      loser = rightTeam;
-      resolution = 'manual';
-    } else if (ready && hasLeft && hasRight && selected === 'B') {
-      winner = rightTeam;
-      loser = leftTeam;
-      resolution = 'manual';
+    if (ready && hasLeft && hasRight) {
+      if (score.A > score.B) {
+        winner = leftTeam;
+        loser = rightTeam;
+        resolution = 'score';
+      } else if (score.B > score.A) {
+        winner = rightTeam;
+        loser = leftTeam;
+        resolution = 'score';
+      } else if (penaltyScore.A !== '' && penaltyScore.B !== '' && penaltyScore.A > penaltyScore.B) {
+        winner = leftTeam;
+        loser = rightTeam;
+        resolution = 'penalties';
+      } else if (penaltyScore.A !== '' && penaltyScore.B !== '' && penaltyScore.B > penaltyScore.A) {
+        winner = rightTeam;
+        loser = leftTeam;
+        resolution = 'penalties';
+      } else {
+        resolution = 'tied';
+      }
     } else if (ready && hasLeft !== hasRight) {
       winner = hasLeft ? leftTeam : rightTeam;
       loser = hasLeft ? rightTeam : leftTeam;
@@ -440,12 +547,13 @@ function resolveMatches(template, seededTeams, manualResults) {
       participantA: leftTeam,
       participantB: rightTeam,
       ready,
-      selected,
       winner,
       loser,
       resolved,
       resolution,
-      canPickWinner: ready && hasLeft && hasRight,
+      score,
+      penaltyScore,
+      canEditPenalties: ready && hasLeft && hasRight && score.A === score.B,
     };
 
     cache.set(matchId, data);
@@ -478,6 +586,14 @@ function getEventRows(matchEvents, matchId, side) {
   return matchEvents[matchId]?.[side] ?? [];
 }
 
+function getTeamName(team) {
+  return team?.name ?? 'A definir';
+}
+
+function getPlayersById(team) {
+  return new Map((team?.players ?? []).map((player) => [player.id, player]));
+}
+
 function calculateSideScore(rows, opponentRows) {
   const directGoals = rows.filter((event) => event.type === 'goal' && !event.ownGoal).length;
   const opponentOwnGoals = opponentRows.filter(
@@ -497,6 +613,22 @@ function calculateMatchScore(matchId, matchEvents) {
   };
 }
 
+function clearDescendantData(current, dependencyMap, matchId) {
+  const nextMatchEvents = { ...current.matchEvents };
+  const nextPenalties = { ...current.penalties };
+  const descendants = dependencyMap.get(matchId) ?? new Set();
+
+  descendants.forEach((dependentId) => {
+    delete nextMatchEvents[dependentId];
+    delete nextPenalties[dependentId];
+  });
+
+  return {
+    nextMatchEvents,
+    nextPenalties,
+  };
+}
+
 function createRankingList(map, sortFn) {
   return Array.from(map.values())
     .map((entry) => ({
@@ -512,21 +644,25 @@ function createRankings(matches, matchEvents) {
   const cardsMap = new Map();
 
   matches.forEach((match) => {
-    ['A', 'B'].forEach((side) => {
-      const teamName = side === 'A' ? match.participantA : match.participantB;
-      if (!teamName) {
+    [
+      ['A', match.participantA],
+      ['B', match.participantB],
+    ].forEach(([side, team]) => {
+      if (!team) {
         return;
       }
 
+      const playersById = getPlayersById(team);
+
       getEventRows(matchEvents, match.id, side).forEach((event) => {
-        const playerName = event.playerName.trim();
+        const player = playersById.get(event.playerId);
 
         if (event.type === 'goal') {
-          if (!event.ownGoal && playerName) {
-            const goalKey = `${playerName.toLowerCase()}::${teamName.toLowerCase()}`;
+          if (!event.ownGoal && player) {
+            const goalKey = `${player.id}::${team.id}`;
             const goalEntry = goalsMap.get(goalKey) ?? {
-              name: playerName,
-              team: teamName,
+              name: player.name,
+              team: team.name,
               total: 0,
               matchIds: new Set(),
             };
@@ -536,12 +672,16 @@ function createRankings(matches, matchEvents) {
             goalsMap.set(goalKey, goalEntry);
           }
 
-          const assistName = event.ownGoal ? '' : event.assistName.trim();
-          if (assistName) {
-            const assistKey = `${assistName.toLowerCase()}::${teamName.toLowerCase()}`;
+          if (!event.ownGoal && event.assistPlayerId) {
+            const assistPlayer = playersById.get(event.assistPlayerId);
+            if (!assistPlayer) {
+              return;
+            }
+
+            const assistKey = `${assistPlayer.id}::${team.id}`;
             const assistEntry = assistsMap.get(assistKey) ?? {
-              name: assistName,
-              team: teamName,
+              name: assistPlayer.name,
+              team: team.name,
               total: 0,
               matchIds: new Set(),
             };
@@ -552,11 +692,11 @@ function createRankings(matches, matchEvents) {
           }
         }
 
-        if ((event.type === 'yellow' || event.type === 'red') && playerName) {
-          const cardKey = `${playerName.toLowerCase()}::${teamName.toLowerCase()}`;
+        if ((event.type === 'yellow' || event.type === 'red') && player) {
+          const cardKey = `${player.id}::${team.id}`;
           const cardEntry = cardsMap.get(cardKey) ?? {
-            name: playerName,
-            team: teamName,
+            name: player.name,
+            team: team.name,
             yellow: 0,
             red: 0,
             matchIds: new Set(),
@@ -600,12 +740,81 @@ function createRankings(matches, matchEvents) {
   };
 }
 
-function EventEditor({ teamName, rows, disabled, onAddEvent, onRemoveEvent, onUpdateEvent }) {
+function TeamSetupCard({
+  team,
+  draftPlayerName,
+  onDraftChange,
+  onAddPlayer,
+  onRemovePlayer,
+  onRemoveTeam,
+}) {
+  return (
+    <article className="team-setup-card">
+      <div className="team-setup-card__header">
+        <div>
+          <p className="eyebrow">Time</p>
+          <h3>{team.name}</h3>
+        </div>
+        <button type="button" className="ghost-button ghost-button--small" onClick={() => onRemoveTeam(team.id)}>
+          remover time
+        </button>
+      </div>
+
+      <form
+        className="team-setup-card__form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onAddPlayer(team.id);
+        }}
+      >
+        <label className="field">
+          <span>Jogador do elenco</span>
+          <input
+            type="text"
+            value={draftPlayerName}
+            placeholder="Ex.: Carlos"
+            onChange={(event) => onDraftChange(team.id, event.target.value)}
+          />
+        </label>
+
+        <button type="submit" className="primary-button" disabled={!draftPlayerName.trim()}>
+          Adicionar jogador
+        </button>
+      </form>
+
+      <div className="roster-list">
+        {team.players.length === 0 ? (
+          <p className="empty-state">Cadastre pelo menos um jogador neste time.</p>
+        ) : (
+          team.players.map((player) => (
+            <div key={player.id} className="player-chip">
+              <strong>{player.name}</strong>
+              <button type="button" onClick={() => onRemovePlayer(team.id, player.id)}>
+                remover
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </article>
+  );
+}
+
+function EventEditor({
+  team,
+  rows,
+  disabled,
+  onAddEvent,
+  onRemoveEvent,
+  onUpdateEvent,
+}) {
+  const players = team?.players ?? [];
+
   return (
     <section className="event-editor">
       <div className="event-editor__header">
         <div>
-          <h5>{teamName ?? 'A definir'}</h5>
+          <h5>{getTeamName(team)}</h5>
           <p>Cadastre os eventos deste time nesta partida.</p>
         </div>
         <button
@@ -644,15 +853,20 @@ function EventEditor({ teamName, rows, disabled, onAddEvent, onRemoveEvent, onUp
 
                 <label className="field">
                   <span>Jogador</span>
-                  <input
-                    type="text"
-                    value={event.playerName}
-                    placeholder="Nome do jogador"
+                  <select
+                    value={event.playerId}
                     disabled={disabled}
                     onChange={(changeEvent) =>
-                      onUpdateEvent(event.id, 'playerName', changeEvent.target.value)
+                      onUpdateEvent(event.id, 'playerId', changeEvent.target.value)
                     }
-                  />
+                  >
+                    <option value="">Selecione um jogador</option>
+                    {players.map((player) => (
+                      <option key={player.id} value={player.id}>
+                        {player.name}
+                      </option>
+                    ))}
+                  </select>
                 </label>
               </div>
 
@@ -660,15 +874,22 @@ function EventEditor({ teamName, rows, disabled, onAddEvent, onRemoveEvent, onUp
                 <div className="event-row__goal">
                   <label className="field">
                     <span>Assistencia</span>
-                    <input
-                      type="text"
-                      value={event.assistName}
-                      placeholder="Quem deu a assistencia"
+                    <select
+                      value={event.assistPlayerId}
                       disabled={disabled || event.ownGoal}
                       onChange={(changeEvent) =>
-                        onUpdateEvent(event.id, 'assistName', changeEvent.target.value)
+                        onUpdateEvent(event.id, 'assistPlayerId', changeEvent.target.value)
                       }
-                    />
+                    >
+                      <option value="">Sem assistencia</option>
+                      {players
+                        .filter((player) => player.id !== event.playerId)
+                        .map((player) => (
+                        <option key={player.id} value={player.id}>
+                          {player.name}
+                        </option>
+                        ))}
+                    </select>
                   </label>
 
                   <label className="checkbox-field">
@@ -707,17 +928,19 @@ function MatchCard({
   onAddEvent,
   onRemoveEvent,
   onUpdateEvent,
-  onPickWinner,
+  onUpdatePenalties,
 }) {
-  const score = calculateMatchScore(match.id, matchEvents);
-
   const waitingMessage = !match.ready
     ? 'Aguardando definicao das partidas anteriores.'
-    : !match.canPickWinner && match.resolution === 'bye'
+    : match.resolution === 'bye'
       ? 'Avanco automatico por ausencia de adversario.'
-      : !match.canPickWinner && match.resolution === 'empty'
+      : match.resolution === 'empty'
         ? 'Rodada sem confronto por falta de times nesta chave.'
-        : 'Escolha o vencedor manualmente. O placar e calculado pelos eventos.';
+        : match.resolution === 'tied'
+          ? 'Placar empatado. Registre a disputa por penaltis para definir quem avanca.'
+          : match.resolution === 'penalties'
+            ? 'Classificacao definida nos penaltis.'
+            : 'Classificacao automatica pelo placar do jogo.';
 
   return (
     <article className="match-card">
@@ -727,8 +950,10 @@ function MatchCard({
           <h4>{match.title}</h4>
         </div>
         <span className={`match-card__badge match-card__badge--${match.resolution}`}>
-          {match.resolution === 'manual' && 'Resultado definido'}
+          {match.resolution === 'score' && 'Definido no tempo normal'}
+          {match.resolution === 'penalties' && 'Definido nos penaltis'}
           {match.resolution === 'bye' && 'Bye'}
+          {match.resolution === 'tied' && 'Empatado'}
           {match.resolution === 'pending' && 'Em aberto'}
           {match.resolution === 'empty' && 'Sem duelo'}
         </span>
@@ -737,25 +962,24 @@ function MatchCard({
       <p className="match-card__description">{match.description}</p>
 
       <div className="match-score">
-        <span className="match-score__team">{match.participantA ?? 'A definir'}</span>
+        <span className="match-score__team">{getTeamName(match.participantA)}</span>
         <strong>
-          {score.A} x {score.B}
+          {match.score.A} x {match.score.B}
         </strong>
-        <span className="match-score__team">{match.participantB ?? 'A definir'}</span>
+        <span className="match-score__team">{getTeamName(match.participantB)}</span>
       </div>
 
-      <div className="match-card__teams">
+      <div className="match-card__teams match-card__teams--static">
         {[
-          ['A', match.participantA, score.A],
-          ['B', match.participantB, score.B],
+          ['A', match.participantA, match.score.A],
+          ['B', match.participantB, match.score.B],
         ].map(([side, team, teamScore]) => {
           const isWinner = match.winner === team && Boolean(team);
           const isLoser = match.loser === team && Boolean(team);
 
           return (
-            <button
+            <div
               key={side}
-              type="button"
               className={[
                 'team-option',
                 isWinner ? 'team-option--winner' : '',
@@ -764,34 +988,67 @@ function MatchCard({
               ]
                 .filter(Boolean)
                 .join(' ')}
-              disabled={!match.canPickWinner || !team}
-              onClick={() => onPickWinner(match.id, side)}
             >
               <span className="team-option__side">{side}</span>
-              <span className="team-option__name">{team ?? 'A definir'}</span>
+              <span className="team-option__name">{getTeamName(team)}</span>
               <span className="team-option__score">{teamScore}</span>
-            </button>
+            </div>
           );
         })}
       </div>
 
+      {match.canEditPenalties && (
+        <div className="penalty-box">
+          <div className="penalty-box__header">
+            <h5>Disputa por penaltis</h5>
+            <p>Use apenas quando o placar estiver empatado.</p>
+          </div>
+
+          <div className="penalty-box__fields">
+            <label className="field">
+              <span>{getTeamName(match.participantA)}</span>
+              <input
+                type="number"
+                min="0"
+                value={match.penaltyScore.A}
+                onChange={(event) => onUpdatePenalties(match.id, 'A', event.target.value)}
+              />
+            </label>
+
+            <label className="field">
+              <span>{getTeamName(match.participantB)}</span>
+              <input
+                type="number"
+                min="0"
+                value={match.penaltyScore.B}
+                onChange={(event) => onUpdatePenalties(match.id, 'B', event.target.value)}
+              />
+            </label>
+          </div>
+        </div>
+      )}
+
       <div className="match-card__stats">
         <EventEditor
-          teamName={match.participantA}
+          team={match.participantA}
           rows={getEventRows(matchEvents, match.id, 'A')}
           disabled={!match.participantA}
           onAddEvent={() => onAddEvent(match.id, 'A')}
           onRemoveEvent={(eventId) => onRemoveEvent(match.id, 'A', eventId)}
-          onUpdateEvent={(eventId, field, value) => onUpdateEvent(match.id, 'A', eventId, field, value)}
+          onUpdateEvent={(eventId, field, value) =>
+            onUpdateEvent(match.id, 'A', eventId, field, value)
+          }
         />
 
         <EventEditor
-          teamName={match.participantB}
+          team={match.participantB}
           rows={getEventRows(matchEvents, match.id, 'B')}
           disabled={!match.participantB}
           onAddEvent={() => onAddEvent(match.id, 'B')}
           onRemoveEvent={(eventId) => onRemoveEvent(match.id, 'B', eventId)}
-          onUpdateEvent={(eventId, field, value) => onUpdateEvent(match.id, 'B', eventId, field, value)}
+          onUpdateEvent={(eventId, field, value) =>
+            onUpdateEvent(match.id, 'B', eventId, field, value)
+          }
         />
       </div>
 
@@ -837,6 +1094,7 @@ function RankingBlock({ title, subtitle, items, renderMetrics }) {
 
 export default function App() {
   const [teamName, setTeamName] = useState('');
+  const [playerDrafts, setPlayerDrafts] = useState({});
   const [state, setState] = useState(loadState);
 
   const bracketSize = state.locked ? (state.teams.length <= 4 ? 4 : 8) : null;
@@ -855,8 +1113,8 @@ export default function App() {
     [bracketSize, state.teams],
   );
   const resolvedMatches = useMemo(
-    () => resolveMatches(template, seededTeams, state.results),
-    [template, seededTeams, state.results],
+    () => resolveMatches(template, seededTeams, state.matchEvents, state.penalties),
+    [template, seededTeams, state.matchEvents, state.penalties],
   );
 
   const upperRounds = useMemo(
@@ -876,14 +1134,20 @@ export default function App() {
     [resolvedMatches, state.matchEvents],
   );
 
-  const completedMatches = resolvedMatches.filter((match) => match.resolution === 'manual').length;
-  const champion = resolvedMatches.find((match) => match.id === 'G1')?.winner ?? null;
-  const canStart = state.teams.length >= 4;
-  const hasByes = state.locked && state.teams.length !== bracketSize;
+  const completedMatches = resolvedMatches.filter(
+    (match) => match.resolution === 'score' || match.resolution === 'penalties',
+  ).length;
+  const champion = resolvedMatches.find((match) => match.id === 'G1')?.winner?.name ?? null;
+  const totalPlayers = state.teams.reduce((sum, team) => sum + team.players.length, 0);
   const totalEvents = Object.values(state.matchEvents).reduce(
     (sum, sides) => sum + (sides.A?.length ?? 0) + (sides.B?.length ?? 0),
     0,
   );
+  const canStart =
+    state.teams.length >= 4 &&
+    state.teams.length <= 8 &&
+    state.teams.every((team) => team.players.length > 0);
+  const hasByes = state.locked && state.teams.length !== bracketSize;
 
   useEffect(() => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -897,21 +1161,93 @@ export default function App() {
       return;
     }
 
-    if (state.teams.some((team) => team.toLowerCase() === normalizedName.toLowerCase())) {
+    if (state.teams.some((team) => team.name.toLowerCase() === normalizedName.toLowerCase())) {
       return;
     }
 
     setState((current) => ({
       ...current,
-      teams: [...current.teams, normalizedName],
+      teams: [
+        ...current.teams,
+        {
+          id: createId('team'),
+          name: normalizedName,
+          players: [],
+        },
+      ],
     }));
     setTeamName('');
   }
 
-  function removeTeam(teamToRemove) {
+  function removeTeam(teamId) {
     setState((current) => ({
       ...current,
-      teams: current.teams.filter((team) => team !== teamToRemove),
+      teams: current.teams.filter((team) => team.id !== teamId),
+    }));
+
+    setPlayerDrafts((current) => {
+      const next = { ...current };
+      delete next[teamId];
+      return next;
+    });
+  }
+
+  function updatePlayerDraft(teamId, value) {
+    setPlayerDrafts((current) => ({
+      ...current,
+      [teamId]: value,
+    }));
+  }
+
+  function addPlayerToTeam(teamId) {
+    const playerName = (playerDrafts[teamId] ?? '').trim();
+    if (!playerName) {
+      return;
+    }
+
+    setState((current) => ({
+      ...current,
+      teams: current.teams.map((team) => {
+        if (team.id !== teamId) {
+          return team;
+        }
+
+        if (team.players.some((player) => player.name.toLowerCase() === playerName.toLowerCase())) {
+          return team;
+        }
+
+        return {
+          ...team,
+          players: [
+            ...team.players,
+            {
+              id: createId('player'),
+              name: playerName,
+            },
+          ],
+        };
+      }),
+    }));
+
+    setPlayerDrafts((current) => ({
+      ...current,
+      [teamId]: '',
+    }));
+  }
+
+  function removePlayerFromTeam(teamId, playerId) {
+    setState((current) => ({
+      ...current,
+      teams: current.teams.map((team) => {
+        if (team.id !== teamId) {
+          return team;
+        }
+
+        return {
+          ...team,
+          players: team.players.filter((player) => player.id !== playerId),
+        };
+      }),
     }));
   }
 
@@ -923,8 +1259,8 @@ export default function App() {
     setState((current) => ({
       ...current,
       locked: true,
-      results: {},
       matchEvents: {},
+      penalties: {},
     }));
   }
 
@@ -932,54 +1268,33 @@ export default function App() {
     setState((current) => ({
       ...current,
       locked: false,
-      results: {},
       matchEvents: {},
+      penalties: {},
     }));
   }
 
   function resetTournament() {
     setState(INITIAL_STATE);
     setTeamName('');
-  }
-
-  function handlePickWinner(matchId, side) {
-    setState((current) => {
-      const nextResults = { ...current.results };
-      const nextMatchEvents = { ...current.matchEvents };
-      const descendants = dependencyMap.get(matchId) ?? new Set();
-
-      descendants.forEach((dependentId) => {
-        delete nextResults[dependentId];
-        delete nextMatchEvents[dependentId];
-      });
-
-      if (nextResults[matchId] === side) {
-        delete nextResults[matchId];
-      } else {
-        nextResults[matchId] = side;
-      }
-
-      return {
-        ...current,
-        results: nextResults,
-        matchEvents: nextMatchEvents,
-      };
-    });
+    setPlayerDrafts({});
   }
 
   function handleAddEvent(matchId, side) {
     setState((current) => {
       const matchState = current.matchEvents[matchId] ?? { A: [], B: [] };
+      const { nextMatchEvents, nextPenalties } = clearDescendantData(current, dependencyMap, matchId);
+      delete nextPenalties[matchId];
 
       return {
         ...current,
         matchEvents: {
-          ...current.matchEvents,
+          ...nextMatchEvents,
           [matchId]: {
             ...matchState,
             [side]: [...(matchState[side] ?? []), createEventEntry()],
           },
         },
+        penalties: nextPenalties,
       };
     });
   }
@@ -987,16 +1302,19 @@ export default function App() {
   function handleRemoveEvent(matchId, side, eventId) {
     setState((current) => {
       const matchState = current.matchEvents[matchId] ?? { A: [], B: [] };
+      const { nextMatchEvents, nextPenalties } = clearDescendantData(current, dependencyMap, matchId);
+      delete nextPenalties[matchId];
 
       return {
         ...current,
         matchEvents: {
-          ...current.matchEvents,
+          ...nextMatchEvents,
           [matchId]: {
             ...matchState,
             [side]: (matchState[side] ?? []).filter((event) => event.id !== eventId),
           },
         },
+        penalties: nextPenalties,
       };
     });
   }
@@ -1004,11 +1322,13 @@ export default function App() {
   function handleUpdateEvent(matchId, side, eventId, field, value) {
     setState((current) => {
       const matchState = current.matchEvents[matchId] ?? { A: [], B: [] };
+      const { nextMatchEvents, nextPenalties } = clearDescendantData(current, dependencyMap, matchId);
+      delete nextPenalties[matchId];
 
       return {
         ...current,
         matchEvents: {
-          ...current.matchEvents,
+          ...nextMatchEvents,
           [matchId]: {
             ...matchState,
             [side]: (matchState[side] ?? []).map((event) => {
@@ -1022,16 +1342,39 @@ export default function App() {
               };
 
               if (field === 'type' && value !== 'goal') {
-                updatedEvent.assistName = '';
+                updatedEvent.assistPlayerId = '';
                 updatedEvent.ownGoal = false;
               }
 
               if (field === 'ownGoal' && value) {
-                updatedEvent.assistName = '';
+                updatedEvent.assistPlayerId = '';
+              }
+
+              if (field === 'playerId' && updatedEvent.assistPlayerId === value && value) {
+                updatedEvent.assistPlayerId = '';
               }
 
               return updatedEvent;
             }),
+          },
+        },
+        penalties: nextPenalties,
+      };
+    });
+  }
+
+  function handleUpdatePenalties(matchId, side, value) {
+    setState((current) => {
+      const { nextMatchEvents, nextPenalties } = clearDescendantData(current, dependencyMap, matchId);
+
+      return {
+        ...current,
+        matchEvents: nextMatchEvents,
+        penalties: {
+          ...nextPenalties,
+          [matchId]: {
+            ...(current.penalties[matchId] ?? { A: '', B: '' }),
+            [side]: normalizePenaltyScore(value),
           },
         },
       };
@@ -1047,10 +1390,15 @@ export default function App() {
         <section className="hero">
           <div className="hero__copy">
             <p className="eyebrow">Camp Manager</p>
-            <h1>Gerenciador de campeonatos com chave upper e lower bracket.</h1>
+            <h1>
+              {state.locked
+                ? 'Gerenciador de campeonatos com chave upper e lower bracket.'
+                : 'Monte os times e seus elencos antes de iniciar o campeonato.'}
+            </h1>
             <p className="hero__text">
-              Cadastre entre 4 e 8 times, monte um torneio em dupla eliminacao e registre
-              eventos por partida para alimentar os rankings.
+              {state.locked
+                ? 'Cadastre eventos por partida usando os jogadores de cada elenco e acompanhe os rankings automaticamente.'
+                : 'Nesta etapa voce cadastra os times e seus jogadores. Depois, na tela do campeonato, os eventos usam dropdown com o elenco de cada time.'}
             </p>
           </div>
 
@@ -1060,101 +1408,106 @@ export default function App() {
               <strong>{state.teams.length}</strong>
             </div>
             <div className="stat-card">
-              <span>Tamanho da chave</span>
-              <strong>{bracketSize ?? '-'}</strong>
+              <span>Jogadores</span>
+              <strong>{totalPlayers}</strong>
             </div>
             <div className="stat-card">
-              <span>Eventos</span>
-              <strong>{totalEvents}</strong>
+              <span>{state.locked ? 'Eventos' : 'Pronto para iniciar'}</span>
+              <strong>{state.locked ? totalEvents : canStart ? 'Sim' : 'Nao'}</strong>
             </div>
           </div>
         </section>
 
-        <section className="panel panel--register">
-          <div className="panel__heading">
-            <div>
-              <p className="eyebrow">Cadastro</p>
-              <h2>Registrar times</h2>
-            </div>
-            <div className="panel__actions">
-              <button type="button" className="ghost-button" onClick={resetTournament}>
-                Limpar tudo
-              </button>
-              {state.locked ? (
-                <button type="button" className="ghost-button" onClick={unlockTournament}>
-                  Editar cadastro
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={!canStart}
-                  onClick={startTournament}
-                >
-                  Gerar chaveamento
-                </button>
-              )}
-            </div>
-          </div>
-
-          <form className="register-form" onSubmit={addTeam}>
-            <label className="field">
-              <span>Nome do time</span>
-              <input
-                type="text"
-                value={teamName}
-                onChange={(event) => setTeamName(event.target.value)}
-                placeholder="Ex.: Falcoes do Norte"
-                disabled={state.locked || state.teams.length >= 8}
-              />
-            </label>
-
-            <button
-              type="submit"
-              className="primary-button"
-              disabled={state.locked || !teamName.trim() || state.teams.length >= 8}
-            >
-              Adicionar time
-            </button>
-          </form>
-
-          <div className="team-list">
-            {state.teams.length === 0 ? (
-              <p className="empty-state">Nenhum time cadastrado ainda.</p>
-            ) : (
-              state.teams.map((team, index) => (
-                <div key={team} className="team-chip">
-                  <span className="team-chip__seed">Seed {index + 1}</span>
-                  <strong>{team}</strong>
-                  {!state.locked && (
-                    <button type="button" onClick={() => removeTeam(team)}>
-                      remover
-                    </button>
-                  )}
+        {!state.locked ? (
+          <>
+            <section className="panel panel--register">
+              <div className="panel__heading">
+                <div>
+                  <p className="eyebrow">Tela de Cadastro</p>
+                  <h2>Registrar times e elencos</h2>
                 </div>
-              ))
-            )}
-          </div>
+                <div className="panel__actions">
+                  <button type="button" className="ghost-button" onClick={resetTournament}>
+                    Limpar tudo
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={!canStart}
+                    onClick={startTournament}
+                  >
+                    Ir para o campeonato
+                  </button>
+                </div>
+              </div>
 
-          <div className="helper-grid">
-            <p>
-              O sistema aceita de <strong>4 a 8 times</strong>. Ao gerar a chave, a ordem do
-              cadastro vira o seed do campeonato.
-            </p>
-            <p>
-              Os eventos sao cadastrados por <strong>partida e por time</strong>. Gol contra soma
-              no placar do adversario.
-            </p>
-          </div>
-        </section>
+              <form className="register-form" onSubmit={addTeam}>
+                <label className="field">
+                  <span>Nome do time</span>
+                  <input
+                    type="text"
+                    value={teamName}
+                    onChange={(event) => setTeamName(event.target.value)}
+                    placeholder="Ex.: Falcoes do Norte"
+                    disabled={state.teams.length >= 8}
+                  />
+                </label>
 
-        {state.locked && (
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={!teamName.trim() || state.teams.length >= 8}
+                >
+                  Adicionar time
+                </button>
+              </form>
+
+              <div className="helper-grid">
+                <p>
+                  O campeonato aceita de <strong>4 a 8 times</strong>. A ordem do cadastro
+                  define o seed.
+                </p>
+                <p>
+                  Para iniciar, cada time precisa ter <strong>ao menos um jogador</strong>
+                  cadastrado.
+                </p>
+              </div>
+            </section>
+
+            <section className="team-setup-grid">
+              {state.teams.length === 0 ? (
+                <section className="panel">
+                  <p className="empty-state">
+                    Nenhum time cadastrado ainda. Adicione os times para montar os elencos.
+                  </p>
+                </section>
+              ) : (
+                state.teams.map((team) => (
+                  <TeamSetupCard
+                    key={team.id}
+                    team={team}
+                    draftPlayerName={playerDrafts[team.id] ?? ''}
+                    onDraftChange={updatePlayerDraft}
+                    onAddPlayer={addPlayerToTeam}
+                    onRemovePlayer={removePlayerFromTeam}
+                    onRemoveTeam={removeTeam}
+                  />
+                ))
+              )}
+            </section>
+          </>
+        ) : (
           <>
             <section className="panel panel--summary">
               <div className="panel__heading">
                 <div>
                   <p className="eyebrow">Resumo</p>
                   <h2>Campeonato em andamento</h2>
+                </div>
+                <div className="panel__actions">
+                  <button type="button" className="ghost-button" onClick={unlockTournament}>
+                    Voltar ao cadastro
+                  </button>
                 </div>
               </div>
 
@@ -1169,7 +1522,7 @@ export default function App() {
                   <strong>{bracketSize} posicoes</strong>
                   <p>
                     {seededTeams
-                      .map((team, index) => `Slot ${index + 1}: ${team ?? 'Bye'}`)
+                      .map((team, index) => `Slot ${index + 1}: ${team?.name ?? 'Bye'}`)
                       .join(' | ')}
                   </p>
                 </div>
@@ -1185,12 +1538,12 @@ export default function App() {
                 <div className="summary-card">
                   <span>Resultados definidos</span>
                   <strong>{completedMatches}</strong>
-                  <p>Partidas com vencedor selecionado manualmente.</p>
+                  <p>Partidas definidas automaticamente por placar ou penaltis.</p>
                 </div>
                 <div className="summary-card">
                   <span>Eventos cadastrados</span>
                   <strong>{totalEvents}</strong>
-                  <p>Inclui gols, assistencias, amarelos e vermelhos por partida.</p>
+                  <p>Gols, assistencias e cartoes usando os elencos cadastrados.</p>
                 </div>
               </div>
 
@@ -1294,7 +1647,7 @@ export default function App() {
                             onAddEvent={handleAddEvent}
                             onRemoveEvent={handleRemoveEvent}
                             onUpdateEvent={handleUpdateEvent}
-                            onPickWinner={handlePickWinner}
+                            onUpdatePenalties={handleUpdatePenalties}
                           />
                         ))}
                       </div>
@@ -1324,7 +1677,7 @@ export default function App() {
                             onAddEvent={handleAddEvent}
                             onRemoveEvent={handleRemoveEvent}
                             onUpdateEvent={handleUpdateEvent}
-                            onPickWinner={handlePickWinner}
+                            onUpdatePenalties={handleUpdatePenalties}
                           />
                         ))}
                       </div>
@@ -1354,7 +1707,7 @@ export default function App() {
                             onAddEvent={handleAddEvent}
                             onRemoveEvent={handleRemoveEvent}
                             onUpdateEvent={handleUpdateEvent}
-                            onPickWinner={handlePickWinner}
+                            onUpdatePenalties={handleUpdatePenalties}
                           />
                         ))}
                       </div>
